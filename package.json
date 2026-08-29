@@ -1,0 +1,13 @@
+{
+  "name": "whatsapp-logger",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "baileys": "^7.0.0-rc14",
+    "googleapis": "^140.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
