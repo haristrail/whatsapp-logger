@@ -198,55 +198,71 @@ async function loadSheetTabs() {
   }
 }
 
+function buildFormatRequests(sheetId, withBanding) {
+  const requests = [
+    {
+      updateSheetProperties: {
+        properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
+        fields: 'gridProperties.frozenRowCount',
+      },
+    },
+    {
+      repeatCell: {
+        range: { sheetId, startRowIndex: 0, endRowIndex: 1, endColumnIndex: 5 },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: { red: 0.13, green: 0.27, blue: 0.49 },
+            textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 10 },
+            horizontalAlignment: 'CENTER',
+          },
+        },
+        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
+      },
+    },
+    {
+      autoResizeDimensions: {
+        dimensions: { sheetId, dimension: 'COLUMNS', startIndex: 0, endIndex: 5 },
+      },
+    },
+  ];
+  if (withBanding) {
+    requests.push({
+      addBanding: {
+        bandedRange: {
+          range: { sheetId, startRowIndex: 1, endRowIndex: PAGE_SIZE + 1, endColumnIndex: 5 },
+          rowProperties: {
+            headerColor: { red: 0.9, green: 0.93, blue: 0.97 },
+            firstBandColor: { red: 1, green: 1, blue: 1 },
+            secondBandColor: { red: 0.95, green: 0.96, blue: 0.98 },
+          },
+        },
+      },
+    });
+  }
+  return requests;
+}
+
 async function formatSheet(sheetName) {
   const sheetId = sheetIds.get(sheetName);
   if (sheetId === undefined) return;
   try {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SHEET_ID,
-      requestBody: {
-        requests: [
-          {
-            updateSheetProperties: {
-              properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
-              fields: 'gridProperties.frozenRowCount',
-            },
-          },
-          {
-            repeatCell: {
-              range: { sheetId, startRowIndex: 0, endRowIndex: 1, endColumnIndex: 5 },
-              cell: {
-                userEnteredFormat: {
-                  backgroundColor: { red: 0.13, green: 0.27, blue: 0.49 },
-                  textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 10 },
-                  horizontalAlignment: 'CENTER',
-                },
-              },
-              fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
-            },
-          },
-          {
-            addBanding: {
-              bandedRange: {
-                range: { sheetId, startRowIndex: 1, endRowIndex: PAGE_SIZE + 1, endColumnIndex: 5 },
-                rowProperties: {
-                  headerColor: { red: 0.9, green: 0.93, blue: 0.97 },
-                  firstBandColor: { red: 1, green: 1, blue: 1 },
-                  secondBandColor: { red: 0.95, green: 0.96, blue: 0.98 },
-                },
-              },
-            },
-          },
-          {
-            autoResizeDimensions: {
-              dimensions: { sheetId, dimension: 'COLUMNS', startIndex: 0, endIndex: 5 },
-            },
-          },
-        ],
-      },
+      requestBody: { requests: buildFormatRequests(sheetId, true) },
     });
     console.log('Formatted tab: ' + sheetName);
   } catch (err) {
+    if (String(err.message || '').includes('already has alternating background colors')) {
+      try {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: SHEET_ID,
+          requestBody: { requests: buildFormatRequests(sheetId, false) },
+        });
+      } catch (err2) {
+        console.error('Sheet format error (' + sheetName + '):', err2.message);
+      }
+      return;
+    }
     console.error('Sheet format error (' + sheetName + '):', err.message);
   }
 }
