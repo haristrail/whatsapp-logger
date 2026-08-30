@@ -34,7 +34,8 @@ const sheetIds = new Map();
 const tabForSender = new Map();
 const tabOwners = new Map();
 const tabRows = new Map();
-const PAGE_SIZE = 300;
+const PAGE_SIZE = 20000;
+const MASTER_TAB = 'Chat Logger';
 
 const contactNames = new Map();
 let lastBlobHash = null;
@@ -199,6 +200,7 @@ async function loadSheetTabs() {
 }
 
 function buildFormatRequests(sheetId, withBanding) {
+  const COL = 6;
   const requests = [
     {
       updateSheetProperties: {
@@ -208,37 +210,53 @@ function buildFormatRequests(sheetId, withBanding) {
     },
     {
       repeatCell: {
-        range: { sheetId, startRowIndex: 0, endRowIndex: 1, endColumnIndex: 5 },
+        range: { sheetId, startRowIndex: 0, endRowIndex: 1, endColumnIndex: COL },
         cell: {
           userEnteredFormat: {
-            backgroundColor: { red: 0.13, green: 0.27, blue: 0.49 },
-            textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 10 },
+            backgroundColor: { red: 0.18, green: 0.35, blue: 0.58 },
+            textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true, fontSize: 10, fontFamily: 'Segoe UI' },
             horizontalAlignment: 'CENTER',
+            verticalAlignment: 'MIDDLE',
           },
         },
-        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
+        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
       },
     },
     {
       autoResizeDimensions: {
-        dimensions: { sheetId, dimension: 'COLUMNS', startIndex: 0, endIndex: 5 },
+        dimensions: { sheetId, dimension: 'COLUMNS', startIndex: 0, endIndex: COL },
       },
     },
   ];
+  const widths = [110, 105, 170, 125, 95, 460];
+  widths.forEach((w, i) => {
+    requests.push({
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'COLUMNS', startIndex: i, endIndex: i + 1 },
+        properties: { pixelSize: w },
+        fields: 'pixelSize',
+      },
+    });
+  });
   if (withBanding) {
     requests.push({
       addBanding: {
         bandedRange: {
-          range: { sheetId, startRowIndex: 1, endRowIndex: PAGE_SIZE + 1, endColumnIndex: 5 },
+          range: { sheetId, startRowIndex: 1, endRowIndex: PAGE_SIZE + 1, endColumnIndex: COL },
           rowProperties: {
             headerColor: { red: 0.9, green: 0.93, blue: 0.97 },
             firstBandColor: { red: 1, green: 1, blue: 1 },
-            secondBandColor: { red: 0.95, green: 0.96, blue: 0.98 },
+            secondBandColor: { red: 0.96, green: 0.97, blue: 0.99 },
           },
         },
       },
     });
   }
+  requests.push({
+    setBasicFilter: {
+      filter: { range: { sheetId, startRowIndex: 0, endRowIndex: PAGE_SIZE + 1, endColumnIndex: COL } },
+    },
+  });
   return requests;
 }
 
@@ -282,9 +300,9 @@ async function ensureSheet(sheetName) {
     tabRows.set(sheetName, 1);
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `'${sheetName}'!A1:E1`,
+      range: `'${sheetName}'!A1:F1`,
       valueInputOption: 'RAW',
-      requestBody: { values: [['Date', 'Time', 'Name', 'Sender', 'Message']] },
+      requestBody: { values: [['Date', 'Time', 'Name', 'Sender', 'Type', 'Message']] },
     });
     await formatSheet(sheetName);
     console.log('Created sheet tab: ' + sheetName);
@@ -309,28 +327,26 @@ async function getTabRows(sheetName) {
   }
 }
 
-async function pickPage(key, displayName) {
-  const base = tabNameFor(key, displayName);
-  let current = tabForSender.get(key) || base;
+async function masterPage() {
+  let current = MASTER_TAB;
   for (let i = 0; i < 20; i++) {
     await ensureSheet(current);
     let count = await getTabRows(current);
     if (count < PAGE_SIZE) return { tab: current, count };
     current = nextPageName(current);
-    tabForSender.set(key, current);
   }
   return { tab: current, count: PAGE_SIZE };
 }
 
-async function appendToSheet(sheetName, date, time, name, sender, message) {
+async function appendToSheet(sheetName, date, time, name, sender, type, message) {
   if (!sheets) return false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
-        range: `'${sheetName}'!A:E`,
+        range: `'${sheetName}'!A:F`,
         valueInputOption: 'RAW',
-        requestBody: { values: [[date, time, name ?? '', sender ?? '', message]] },
+        requestBody: { values: [[date, time, name ?? '', sender ?? '', type, message]] },
       });
       return true;
     } catch (err) {
@@ -341,20 +357,68 @@ async function appendToSheet(sheetName, date, time, name, sender, message) {
   return false;
 }
 
-function getMessageText(msg) {
-  if (msg.conversation) return msg.conversation;
-  if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
-  if (msg.imageMessage?.caption) return msg.imageMessage.caption;
-  if (msg.videoMessage?.caption) return msg.videoMessage.caption;
-  if (msg.documentMessage?.fileName) return '[document: ' + msg.documentMessage.fileName + ']';
-  if (msg.contactMessage?.displayName) return '[contact: ' + msg.contactMessage.displayName + ']';
-  if (msg.locationMessage) return '[location]';
-  if (msg.audioMessage) return '[audio message]';
-  if (msg.imageMessage) return '[image message]';
-  if (msg.videoMessage) return '[video message]';
-  if (msg.stickerMessage) return '[sticker]';
-  if (msg.pttMessage) return '[voice message]';
-  return '[non-text message]';
+function capLen(s, n) {
+  const str = String(s || '');
+  return str.length > n ? str.slice(0, n) + '…' : str;
+}
+
+function unwrapContent(m) {
+  while (m && (m.viewOnceMessage?.message || m.ephemeralMessage?.message || m.documentWithCaptionMessage?.message || m.imageMessageWithContextInfo?.message || m.videoMessageWithContextInfo?.message || m.audioMessageWithContextInfo?.message)) {
+    m = (m.viewOnceMessage || m.ephemeralMessage || m.documentWithCaptionMessage || m.imageMessageWithContextInfo || m.videoMessageWithContextInfo || m.audioMessageWithContextInfo)?.message || m;
+  }
+  return m;
+}
+
+function getMessageInfo(msg) {
+  let m = unwrapContent(msg);
+  if (!m) return { type: 'Other', text: '' };
+  if (m.protocolMessage) {
+    if (m.protocolMessage.type === 0) return { type: 'Deleted', text: '[deleted message]' };
+    return null;
+  }
+  if (m.callingMessage) return { type: 'Call', text: '[call]' };
+  if (m.conversation != null) return { type: 'Text', text: String(m.conversation) };
+  if (m.extendedTextMessage) return { type: 'Text', text: m.extendedTextMessage.text || '' };
+  if (m.imageMessage) return { type: 'Image', text: m.imageMessage.caption ? capLen(m.imageMessage.caption, 1000) : '' };
+  if (m.videoMessage) return { type: 'Video', text: m.videoMessage.caption ? capLen(m.videoMessage.caption, 1000) : '' };
+  if (m.pttMessage) return { type: 'Voice', text: '[' + (m.pttMessage.seconds || 0) + 's]' };
+  if (m.audioMessage) return { type: 'Audio', text: '[' + (m.audioMessage.seconds || 0) + 's]' };
+  if (m.stickerMessage) return { type: 'Sticker', text: m.stickerMessage.emoji ? '[' + m.stickerMessage.emoji + ']' : '' };
+  if (m.documentMessage) {
+    const d = m.documentMessage;
+    return { type: 'Document', text: d.fileName ? '[' + capLen(d.fileName, 300) + ']' : '' };
+  }
+  if (m.contactMessage) {
+    return { type: 'Contact', text: m.contactMessage.displayName ? '[' + capLen(m.contactMessage.displayName, 200) + ']' : '[contact card]' };
+  }
+  if (m.locationMessage) {
+    const l = m.locationMessage;
+    return { type: 'Location', text: '[' + (l.degreesLatitude || 0) + ', ' + (l.degreesLongitude || 0) + ']' };
+  }
+  if (m.groupInviteMessage) {
+    return { type: 'Group invite', text: '[' + capLen(m.groupInviteMessage.groupName || 'invite', 200) + ']' };
+  }
+  if (m.pollCreationMessage) {
+    return { type: 'Poll', text: '[' + capLen(m.pollCreationMessage.name || 'poll', 300) + ']' };
+  }
+  if (m.pollUpdateMessage) return { type: 'Poll vote', text: '' };
+  if (m.reactionMessage) {
+    return { type: 'Reaction', text: m.reactionMessage.text ? '[' + m.reactionMessage.text + ']' : '[reacted]' };
+  }
+  if (m.buttonsResponseMessage) {
+    return { type: 'Button reply', text: '[' + capLen(m.buttonsResponseMessage.selectedDisplayText || 'reply', 200) + ']' };
+  }
+  if (m.listResponseMessage) {
+    return { type: 'List reply', text: '[' + capLen(m.listResponseMessage.title || 'reply', 200) + ']' };
+  }
+  if (m.checkInMessage) return { type: 'Check-in', text: '' };
+  if (m.keepMessage) return { type: 'Kept', text: '[kept message]' };
+  if (m.editedMessage) {
+    const inner = getMessageInfo(m.editedMessage.message);
+    if (!inner) return null;
+    return { type: inner.type + ' (edited)', text: inner.text };
+  }
+  return { type: 'Other', text: '[non-text message]' };
 }
 
 function normalizeJid(jid) {
@@ -462,11 +526,14 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       if (msg.key.remoteJid === 'status@broadcast') continue;
+      const info = getMessageInfo(msg.message);
+      if (!info) continue;
       const jid = msg.key.remoteJid || '';
       const sender = await resolveSender(jid);
       const name = resolveName(jid, sender);
-      const text = getMessageText(msg.message);
-      const { tab, count } = await pickPage(sender, name);
+      const { type, text } = info;
+      const content = type === 'Text' ? (text || '') : text.startsWith('[') ? text : (text ? `[${type}] ${text}` : `[${type}]`);
+      const { tab, count } = await masterPage();
       const now = new Date();
       const opts = { timeZone: 'Asia/Karachi' };
       const ok = await appendToSheet(
@@ -475,10 +542,39 @@ async function startBot() {
         now.toLocaleTimeString('en-PK', opts),
         name,
         sender,
-        text
+        type,
+        content
       );
       if (ok) tabRows.set(tab, count + 1);
-      console.log(`Logged to "${tab}" from ${name} (${sender}) (sheet: ${ok ? 'ok' : 'FAILED'}): ${text}`);
+      console.log(`Logged to "${tab}" [${type}] from ${name} (${sender}) (sheet: ${ok ? 'ok' : 'FAILED'}): ${content}`);
+    }
+  });
+
+  const handledCalls = new Set();
+  sock.ev.on('call', async ({ calls }) => {
+    for (const call of calls) {
+      if (handledCalls.has(call.id)) continue;
+      handledCalls.add(call.id);
+      if (handledCalls.size > 2000) handledCalls.delete(handledCalls.values().next().value);
+      const sender = await resolveSender(call.from);
+      const name = resolveName(call.from, sender);
+      const statusText =
+        { offer: 'incoming', ringing: 'ringing', accept: 'accepted', reject: 'rejected', timeout: 'missed (no answer)', ended: 'ended' }[call.status] || call.status;
+      const content = `[call ${call.isVideo ? 'video' : 'audio'} · ${statusText}]`;
+      const { tab, count } = await masterPage();
+      const now = new Date();
+      const opts = { timeZone: 'Asia/Karachi' };
+      const ok = await appendToSheet(
+        tab,
+        now.toLocaleDateString('en-PK', opts),
+        now.toLocaleTimeString('en-PK', opts),
+        name,
+        sender,
+        'Call',
+        content
+      );
+      if (ok) tabRows.set(tab, count + 1);
+      console.log(`CALL ${statusText} from ${name} (${sender}) -> ${tab} (sheet: ${ok ? 'ok' : 'FAILED'}): ${content}`);
     }
   });
 }
