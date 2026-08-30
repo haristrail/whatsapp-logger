@@ -35,7 +35,9 @@ const tabForSender = new Map();
 const tabOwners = new Map();
 const tabRows = new Map();
 const PAGE_SIZE = 20000;
-const MASTER_TAB = 'Chat Logger';
+const DM_TAB = 'Direct Messages';
+const MEDIA_DIR = path.join(__dirname, 'media');
+const groupNames = new Map();
 
 const contactNames = new Map();
 let lastBlobHash = null;
@@ -327,8 +329,23 @@ async function getTabRows(sheetName) {
   }
 }
 
-async function masterPage() {
-  let current = MASTER_TAB;
+function isGroupJid(jid) {
+  return (jid || '').endsWith('@g.us');
+}
+
+async function groupTabName(sock, jid) {
+  if (groupNames.has(jid)) return groupNames.get(jid);
+  try {
+    const meta = await sock.groupMetadata(jid);
+    groupNames.set(jid, sanitizeTabName(meta.subject || 'Group ' + normalizeJid(jid)));
+  } catch {
+    groupNames.set(jid, 'Group ' + normalizeJid(jid));
+  }
+  return groupNames.get(jid);
+}
+
+async function pageFor(sock, jid) {
+  let current = isGroupJid(jid) ? await groupTabName(sock, jid) : DM_TAB;
   for (let i = 0; i < 20; i++) {
     await ensureSheet(current);
     let count = await getTabRows(current);
@@ -360,6 +377,43 @@ async function appendToSheet(sheetName, date, time, name, sender, type, message)
 function capLen(s, n) {
   const str = String(s || '');
   return str.length > n ? str.slice(0, n) + '…' : str;
+}
+
+const EXT_BY_MIME = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif',
+  'video/mp4': '.mp4', 'video/3gpp': '.3gp', 'audio/ogg': '.ogg', 'audio/opus': '.opus',
+  'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/aac': '.aac', 'application/pdf': '.pdf',
+  'text/plain': '.txt', 'application/zip': '.zip',
+};
+function extFromMime(mime) {
+  if (EXT_BY_MIME[mime]) return EXT_BY_MIME[mime];
+  const part = (mime || '').split('/')[1];
+  return part ? '.' + part.replace(/[^a-z0-9]/gi, '').toLowerCase() : '.bin';
+}
+function mediaBase() {
+  return new Date().toISOString().slice(2, 19).replace(/[-:T]/g, '');
+}
+async function downloadAndSave(sock, msg, sub, mime, baseName) {
+  try {
+    const buf = await sock.downloadMediaMessage(msg, 'buffer');
+    if (!buf || buf.length === 0) return null;
+    fs.mkdirSync(path.join(MEDIA_DIR, sub), { recursive: true });
+    const ext = extFromMime(mime);
+    const name = (baseName ? String(baseName).replace(/[^\w.-]+/g, '_').slice(0, 50) : sub + '_' + mediaBase()) + '_' + Math.floor(Math.random() * 1000) + ext;
+    fs.writeFileSync(path.join(MEDIA_DIR, sub, name), buf);
+    return path.relative(__dirname, path.join(MEDIA_DIR, sub, name)).replace(/\\/g, '/');
+  } catch (err) {
+    console.error('Media save error (' + sub + '):', err.message);
+    return null;
+  }
+}
+
+function mediaContent(type, mediaPath, extra) {
+  const tag = '[' + type + ']';
+  if (mediaPath && extra) return tag + ' ' + mediaPath + ' · ' + capLen(extra, 500);
+  if (mediaPath) return tag + ' ' + mediaPath;
+  if (extra) return tag + ' ' + capLen(extra, 500);
+  return tag;
 }
 
 function unwrapContent(m) {
@@ -529,11 +583,39 @@ async function startBot() {
       const info = getMessageInfo(msg.message);
       if (!info) continue;
       const jid = msg.key.remoteJid || '';
-      const sender = await resolveSender(jid);
-      const name = resolveName(jid, sender);
+      const isGroup = isGroupJid(jid);
+      const senderJid = isGroup && msg.key.participant ? msg.key.participant : jid;
+      const sender = await resolveSender(senderJid);
+      const name = resolveName(senderJid, sender);
+
       const { type, text } = info;
-      const content = type === 'Text' ? (text || '') : text.startsWith('[') ? text : (text ? `[${type}] ${text}` : `[${type}]`);
-      const { tab, count } = await masterPage();
+      const mm = msg.message;
+      let mediaPath = null;
+      if (mm.imageMessage) mediaPath = await downloadAndSave(sock, msg, 'Images', mm.imageMessage.mimetype, null)
+        .catch(() => null);
+      else if (mm.videoMessage) mediaPath = await downloadAndSave(sock, msg, 'Videos', mm.videoMessage.mimetype, null)
+        .catch(() => null);
+      else if (mm.pttMessage) mediaPath = await downloadAndSave(sock, msg, 'Voices', 'audio/ogg', null).catch(() => null);
+      else if (mm.audioMessage) mediaPath = await downloadAndSave(sock, msg, 'Audio', mm.audioMessage.mimetype, null)
+        .catch(() => null);
+      else if (mm.stickerMessage) mediaPath = await downloadAndSave(sock, msg, 'Stickers', 'image/webp', null)
+        .catch(() => null);
+      else if (mm.documentMessage) mediaPath = await downloadAndSave(sock, msg, 'Documents', mm.documentMessage.mimetype, mm.documentMessage.fileName).catch(() => null);
+      else if (mm.contactMessage) mediaPath = await downloadAndSave(sock, msg, 'Contacts', 'text/vcard', (mm.contactMessage.displayName || 'contact') + '.vcf').catch(() => null);
+
+      const isMedia = ['Image', 'Video', 'Voice', 'Audio', 'Sticker', 'Document', 'Contact'].includes(type);
+      const content =
+        type === 'Text'
+          ? text || ''
+          : isMedia
+            ? mediaContent(type, mediaPath, text)
+            : text.startsWith('[')
+              ? text
+              : text
+                ? `[${type}] ${text}`
+                : `[${type}]`;
+
+      const { tab, count } = await pageFor(sock, jid);
       const now = new Date();
       const opts = { timeZone: 'Asia/Karachi' };
       const ok = await appendToSheet(
@@ -561,7 +643,7 @@ async function startBot() {
       const statusText =
         { offer: 'incoming', ringing: 'ringing', accept: 'accepted', reject: 'rejected', timeout: 'missed (no answer)', ended: 'ended' }[call.status] || call.status;
       const content = `[call ${call.isVideo ? 'video' : 'audio'} · ${statusText}]`;
-      const { tab, count } = await masterPage();
+      const { tab, count } = await pageFor(sock, call.from);
       const now = new Date();
       const opts = { timeZone: 'Asia/Karachi' };
       const ok = await appendToSheet(
